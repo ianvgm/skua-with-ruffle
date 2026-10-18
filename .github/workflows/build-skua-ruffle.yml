@@ -30,6 +30,131 @@ jobs:
           tar -xzf ruffle-rs-ruffle-0.7.1.tgz -C ruffle-host/ruffle --strip-components=1 --exclude=*.map
           Get-ChildItem ruffle-host/ruffle | Select-Object Name, Length
 
+      - name: Criar arquivos do Ruffle (index.html e GameContainer)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ruffle-host | Out-Null
+          $content = @'
+          <!doctype html>
+          <html><head><meta charset="utf-8">
+          <style>html,body{margin:0;height:100%;background:#000;overflow:hidden}#game{width:100%;height:100%}</style>
+          <script src="ruffle/ruffle.js"></script>
+          </head><body><div id="game"></div>
+          <script>
+          // ---- Flash-ActiveX-compatible XML encoding, so the C# side keeps parsing exactly as before ----
+          const esc = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+          function toXml(v){
+            if (v === null || v === undefined) return "<null/>";
+            if (v === true) return "<true/>";
+            if (v === false) return "<false/>";
+            if (typeof v === "number") return "<number>"+v+"</number>";
+            if (Array.isArray(v)) return "<array>"+v.map((x,i)=>'<property id="'+i+'">'+toXml(x)+"</property>").join("")+"</array>";
+            if (typeof v === "object") return "<object>"+Object.keys(v).map(k=>'<property id="'+esc(k)+'">'+toXml(v[k])+"</property>").join("")+"</object>";
+            return "<string>"+esc(v)+"</string>";
+          }
+          const post = m => window.chrome.webview.postMessage(m);
+
+          // ---- SWF -> host (ExternalInterface.call). Names taken from Skua.AS3 ----
+          for (const n of ["loaded","packet","pext","packetFromServer","requestLoadGame","debug","openWebsite"]) {
+            window[n] = (...a) => { post('<invoke name="'+n+'" returntype="xml"><arguments>'+a.map(toXml).join("")+"</arguments></invoke>"); };
+          }
+
+          // ---- host -> SWF (ExternalInterface.addCallback), called by C# via ExecuteScriptAsync ----
+          let player;
+          window.__skuaCall = (name, args) => {
+            try { return toXml(player[name](...args)); }
+            catch (e) { console.error("skuaCall", name, e); return "<null/>"; }
+          };
+
+          // Called by C# once the WebSocket->TCP proxy is up. cfg = {socketProxy:[{host,port,proxyUrl}], parameters:{}}
+          window.__skuaStart = cfg => {
+            window.RufflePlayer = window.RufflePlayer || {};
+            const ruffle = window.RufflePlayer.newest();
+            player = ruffle.createPlayer();
+            player.style.width = "100%"; player.style.height = "100%";
+            player.config = {
+              publicPath: "ruffle/", autoplay: "on", unmuteOverlay: "hidden", splashScreen: false,
+              contextMenu: "off", letterbox: "on", allowScriptAccess: true, openUrlMode: "allow",
+              socketProxy: cfg.socketProxy, parameters: cfg.parameters || {}, logLevel: "warn"
+            };
+            document.getElementById("game").appendChild(player);
+            player.load({ url: "skua.swf" });
+          };
+          post("<ready/>");
+          </script></body></html>
+          '@
+          Set-Content -Path "ruffle-host/index.html" -Value $content -Encoding UTF8
+          $content = @'
+          <UserControl
+              x:Class="Skua.WPF.UserControls.GameContainerUserControl"
+              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+              xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+              xmlns:local="clr-namespace:Skua.WPF"
+              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+              d:DesignHeight="450"
+              d:DesignWidth="800"
+              mc:Ignorable="d">
+              <Grid>
+                  <ProgressBar
+                      x:Name="LoadingBar"
+                      Width="150"
+                      Height="150"
+                      IsIndeterminate="True"
+                      Style="{StaticResource MaterialDesignCircularProgressBar}" />
+                  <!-- Was a WindowsFormsHost; now a plain Border that receives the WebView2 (Ruffle) -->
+                  <Border
+                      x:Name="gameContainer"
+                      Margin="1,0,1,1"
+                      Panel.ZIndex="1"
+                      Visibility="Hidden" />
+              </Grid>
+          </UserControl>
+          '@
+          Set-Content -Path "Skua.WPF/UserControls/GameContainerUserControl.xaml" -Value $content -Encoding UTF8
+          $content = @'
+          using CommunityToolkit.Mvvm.DependencyInjection;
+          using CommunityToolkit.Mvvm.Messaging;
+          using Skua.Core.Interfaces;
+          using Skua.WPF.Flash;
+          using System.Windows;
+          using System.Windows.Controls;
+
+          namespace Skua.WPF.UserControls;
+
+          public partial class GameContainerUserControl : UserControl
+          {
+              private IScriptInterface _bot;
+
+              public GameContainerUserControl()
+              {
+                  InitializeComponent();
+                  _bot = Ioc.Default.GetRequiredService<IScriptInterface>();
+                  gameContainer.Visibility = Visibility.Hidden;
+                  WeakReferenceMessenger.Default.Register<GameContainerUserControl, RuffleViewChangedMessage>(this, (r, m) => r.gameContainer.Child = m.View);
+                  Loaded += GameContainer_Loaded;
+              }
+
+              private void GameContainer_Loaded(object sender, RoutedEventArgs e)
+              {
+                  _bot.Flash.FlashCall += LoadingFlash;
+                  _bot.Flash.InitializeFlash();
+                  Loaded -= GameContainer_Loaded;
+              }
+
+              private void LoadingFlash(string function, params object[] args)
+              {
+                  if (function == "loaded")
+                  {
+                      LoadingBar.Visibility = Visibility.Hidden;
+                      gameContainer.Visibility = Visibility.Visible;
+                      _bot.Flash.FlashCall -= LoadingFlash;
+                  }
+              }
+          }
+          '@
+          Set-Content -Path "Skua.WPF/UserControls/GameContainerUserControl.xaml.cs" -Value $content -Encoding UTF8
+
       - name: Aplicar patch do Ruffle
         shell: pwsh
         run: |
