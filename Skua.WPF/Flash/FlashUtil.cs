@@ -40,7 +40,7 @@ public class RuffleFlashUtil : IFlashUtil
     private static readonly object _logLock = new();
     private static readonly string _logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Skua", "ruffle-log.txt");
 
-    private static void Log(string text)
+    internal static void Log(string text)
     {
         try
         {
@@ -129,8 +129,22 @@ public class RuffleFlashUtil : IFlashUtil
         var proxies = new JArray();
         try
         {
-            using var http = new HttpClient();
-            var servers = JArray.Parse(await http.GetStringAsync("http://content.aq.com/game/api/data/servers"));
+            string json;
+            try
+            {
+                // Same client Skua itself uses for this request (User-Agent + headers the server expects).
+                json = await HttpClients.GetGHClient().GetStringAsync("http://content.aq.com/game/api/data/servers");
+            }
+            catch (Exception ex1)
+            {
+                Log("server list via Skua client FAILED: " + ex1.Message + " -> retrying with plain client");
+                using var http = new HttpClient();
+                http.DefaultRequestHeaders.UserAgent.ParseAdd("Skua");
+                http.DefaultRequestHeaders.Accept.ParseAdd("application/json");
+                json = await http.GetStringAsync("http://content.aq.com/game/api/data/servers");
+            }
+            Log($"server list: {json.Length} chars, starts: {(json.Length > 160 ? json[..160] : json)}");
+            var servers = JArray.Parse(json);
             foreach (var s in servers)   // field names (sIP / iPort) must be verified against the live response
             {
                 string ip = (string)s["sIP"]!; int port = (int)s["iPort"]!;
@@ -272,10 +286,13 @@ public sealed class TcpWebSocketProxy : IDisposable
         {
             var q = HttpUtility.ParseQueryString(ctx.Request.Url!.Query);
             string host = q["h"]!; int port = int.Parse(q["p"]!);
+            RuffleFlashUtil.Log($"PROXY: websocket request for {host}:{port}");
             var ws = (await ctx.AcceptWebSocketAsync(null)).WebSocket;
             using var tcp = new TcpClient();
             await tcp.ConnectAsync(host, port);
+            RuffleFlashUtil.Log($"PROXY: TCP connected to {host}:{port}");
             var ns = tcp.GetStream();
+            long sent = 0, recv = 0;
 
             var up = Task.Run(async () =>      // Ruffle -> server
             {
@@ -285,6 +302,8 @@ public sealed class TcpWebSocketProxy : IDisposable
                     var r = await ws.ReceiveAsync(buf.AsMemory(), _cts.Token);
                     if (r.MessageType == WebSocketMessageType.Close) break;
                     await ns.WriteAsync(buf.AsMemory(0, r.Count), _cts.Token);
+                    sent += r.Count;
+                    if (sent == r.Count) RuffleFlashUtil.Log($"PROXY: first client->server {r.Count} bytes");
                 }
             });
             var down = Task.Run(async () =>    // server -> Ruffle
@@ -293,11 +312,14 @@ public sealed class TcpWebSocketProxy : IDisposable
                 int n;
                 while ((n = await ns.ReadAsync(buf, _cts.Token)) > 0)
                     await ws.SendAsync(buf.AsMemory(0, n), WebSocketMessageType.Binary, true, _cts.Token);
+                    recv += n;
+                    if (recv == n) RuffleFlashUtil.Log($"PROXY: first server->client {n} bytes");
             });
             await Task.WhenAny(up, down);
+            RuffleFlashUtil.Log($"PROXY: closed {host}:{port} sent={sent} recv={recv}");
             try { await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "", CancellationToken.None); } catch { }
         }
-        catch { try { ctx.Response.Abort(); } catch { } }
+        catch (Exception ex) { RuffleFlashUtil.Log("PROXY ERROR: " + ex.Message); try { ctx.Response.Abort(); } catch { } }
     }
 
     public void Dispose() { _cts.Cancel(); try { _http.Close(); } catch { } }
