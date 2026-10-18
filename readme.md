@@ -49,15 +49,6 @@ in the Discord
 
 Skua developers need your support to improve Skua. You can donate or sponsor us by clicking the PayPal link below. Thank you for your support.
 
-### purple/SharpTheNightmare (Current Dev)
-
-- [Ko-Fi](https://ko-fi.com/sharpthenightmare)
-- ETH: `0xd66fb89f503c9c14093479178d817c9e87d7c0de`
-
-### [Breno Henrike's PayPal (Inactive) (Creator)](https://www.paypal.com/donate?hosted_button_id=QVQ4Q7XSH9VBY)
-
-### [Lord Exelot's PayPal (Inactive) (Brief work on Skua, Ex Scripts Manager)](www.paypal.me/LordExelot)
-
 ## Contributors
 
 - **Breno Henrike**, the artist of Skua.
