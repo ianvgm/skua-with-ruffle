@@ -38,6 +38,17 @@ jobs:
           <!doctype html>
           <html><head><meta charset="utf-8">
           <style>html,body{margin:0;height:100%;background:#000;overflow:hidden}#game{width:100%;height:100%}</style>
+          <script>
+          // Forward console output and errors to the host log (%LOCALAPPDATA%\Skua\ruffle-log.txt)
+          const __post = m => { try { window.chrome.webview.postMessage(m); } catch (e) {} };
+          const __esc = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;");
+          for (const k of ["log","info","warn","error"]) {
+            const o = console[k].bind(console);
+            console[k] = (...a) => { o(...a); __post("<log>["+k+"] "+__esc(a.map(x=>{try{return typeof x==="string"?x:JSON.stringify(x)}catch(e){return String(x)}}).join(" ")).slice(0,600)+"</log>"); };
+          }
+          window.addEventListener("error", e => console.error("window.onerror", e.message, e.filename, e.lineno));
+          window.addEventListener("unhandledrejection", e => console.error("unhandledrejection", String(e.reason)));
+          </script>
           <script src="ruffle/ruffle.js"></script>
           </head><body><div id="game"></div>
           <script>
@@ -55,7 +66,7 @@ jobs:
           const post = m => window.chrome.webview.postMessage(m);
 
           // ---- SWF -> host (ExternalInterface.call). Names taken from Skua.AS3 ----
-          for (const n of ["loaded","packet","pext","packetFromServer","requestLoadGame","debug","openWebsite"]) {
+          for (const n of ["loaded","pre-load","packet","pext","packetFromServer","requestLoadGame","debug","openWebsite"]) {
             window[n] = (...a) => { post('<invoke name="'+n+'" returntype="xml"><arguments>'+a.map(toXml).join("")+"</arguments></invoke>"); };
           }
 
@@ -75,7 +86,7 @@ jobs:
             player.config = {
               publicPath: "ruffle/", autoplay: "on", unmuteOverlay: "hidden", splashScreen: false,
               contextMenu: "off", letterbox: "on", allowScriptAccess: true, openUrlMode: "allow",
-              socketProxy: cfg.socketProxy, parameters: cfg.parameters || {}, logLevel: "warn"
+              socketProxy: cfg.socketProxy, parameters: cfg.parameters || {}, logLevel: "info"
             };
             document.getElementById("game").appendChild(player);
             player.load({ url: "skua.swf" });
@@ -107,7 +118,7 @@ jobs:
                       x:Name="gameContainer"
                       Margin="1,0,1,1"
                       Panel.ZIndex="1"
-                      Visibility="Hidden" />
+                      Visibility="Visible" />
               </Grid>
           </UserControl>
           '@
@@ -130,7 +141,6 @@ jobs:
               {
                   InitializeComponent();
                   _bot = Ioc.Default.GetRequiredService<IScriptInterface>();
-                  gameContainer.Visibility = Visibility.Hidden;
                   WeakReferenceMessenger.Default.Register<GameContainerUserControl, RuffleViewChangedMessage>(this, (r, m) => r.gameContainer.Child = m.View);
                   Loaded += GameContainer_Loaded;
               }
