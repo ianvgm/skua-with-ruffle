@@ -1,0 +1,55 @@
+name: Build Skua (Ruffle)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Verificar skua.swf
+        shell: pwsh
+        run: |
+          if (!(Test-Path prebuilt/skua.swf)) { throw "Falta prebuilt/skua.swf no repositorio." }
+
+      - name: Baixar Ruffle (web) do npm
+        shell: pwsh
+        run: |
+          npm pack @ruffle-rs/ruffle@0.7.1
+          New-Item -ItemType Directory -Force ruffle-host/ruffle | Out-Null
+          tar -xzf ruffle-rs-ruffle-0.7.1.tgz -C ruffle-host/ruffle --strip-components=1 --exclude=*.map
+          Get-ChildItem ruffle-host/ruffle | Select-Object Name, Length
+
+      - name: Aplicar patch do Ruffle
+        shell: pwsh
+        run: ./apply-ruffle.ps1
+
+      - name: Restore
+        run: dotnet restore Skua.sln
+
+      - name: Build source generators
+        run: dotnet build Skua.Core.Generators/Skua.Core.Generators.csproj -c Release -p:Platform=AnyCPU
+
+      - name: Build Skua x64
+        run: dotnet build Skua.sln -c Release -p:Platform=x64 --no-restore -p:WarningLevel=0
+
+      - name: Conferir saida
+        shell: pwsh
+        run: |
+          Get-ChildItem Build/x64 | Select-Object Name
+          if (!(Test-Path Build/x64/Assemblies/ruffle-host/index.html) -and !(Test-Path Build/x64/ruffle-host/index.html)) { throw "ruffle-host nao foi copiado para a saida" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Skua-Ruffle-x64
+          path: Build/x64
