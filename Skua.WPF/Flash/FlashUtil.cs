@@ -37,6 +37,21 @@ public class RuffleFlashUtil : IFlashUtil
     private WebView2? _view;
     private TcpWebSocketProxy? _proxy;
     private bool _ready;
+    private static readonly object _logLock = new();
+    private static readonly string _logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Skua", "ruffle-log.txt");
+
+    private static void Log(string text)
+    {
+        try
+        {
+            lock (_logLock)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(_logPath)!);
+                File.AppendAllText(_logPath, $"{DateTime.Now:HH:mm:ss.fff} {text}\n");
+            }
+        }
+        catch { }
+    }
 
     public event FlashCallHandler? FlashCall;
     /// <summary>Raised on the UI thread with the control to place in the window.</summary>
@@ -50,6 +65,8 @@ public class RuffleFlashUtil : IFlashUtil
 
     public void InitializeFlash()
     {
+        try { File.WriteAllText(_logPath, ""); } catch { }
+        Log("InitializeFlash");
         _view = new WebView2 { DefaultBackgroundColor = System.Drawing.Color.Black };
         _messenger.Send(new RuffleViewChangedMessage(_view));
         _ = InitAsync();
@@ -76,12 +93,16 @@ public class RuffleFlashUtil : IFlashUtil
             cw.Settings.AreDevToolsEnabled = true; // F12 for debugging
             cw.SetVirtualHostNameToFolderMapping("skua.local", host, CoreWebView2HostResourceAccessKind.Allow);
             cw.WebMessageReceived += OnWebMessage;
+            cw.NavigationCompleted += (s, a) => Log($"NavigationCompleted success={a.IsSuccess} status={a.WebErrorStatus}");
+            cw.ProcessFailed += (s, a) => Log($"ProcessFailed {a.ProcessFailedKind}");
+            Log("WebView2 ready, host=" + host);
 
             _proxy = new TcpWebSocketProxy(); _proxy.Start();
             cw.Navigate("https://skua.local/index.html");
         }
         catch (Exception e)
         {
+            Log("InitAsync EXCEPTION " + e);
             MessageBox.Show("Failed to start Ruffle/WebView2 (is the WebView2 Runtime installed?)\r\n" + e.Message, "Skua + Ruffle");
             Environment.Exit(0);
         }
@@ -90,6 +111,8 @@ public class RuffleFlashUtil : IFlashUtil
     private async void OnWebMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
     {
         string msg = e.TryGetWebMessageAsString();
+        if (msg.StartsWith("<log>")) { Log(msg); return; }
+        if (!msg.StartsWith("<invoke name=\"packet") && !msg.StartsWith("<invoke name=\"pext")) Log("FROM SWF: " + (msg.Length > 300 ? msg[..300] : msg));
         if (msg == "<ready/>") { await StartGameAsync(); return; }
         try
         {
@@ -98,7 +121,7 @@ public class RuffleFlashUtil : IFlashUtil
             object[] args = el.Elements().Select(x => FromFlashXml(x)).ToArray();
             FlashCall?.Invoke(function, args);
         }
-        catch { /* ignore malformed */ }
+        catch (Exception ex) { Log("OnWebMessage error: " + ex.Message); }
     }
 
     private async Task StartGameAsync()
@@ -118,11 +141,13 @@ public class RuffleFlashUtil : IFlashUtil
                 });
             }
         }
-        catch { /* servers list unavailable: sockets will fail until fixed */ }
+        catch (Exception ex) { Log("server list FAILED: " + ex.Message); }
+        Log("socket proxies: " + proxies.Count);
 
         var cfg = new JObject { ["socketProxy"] = proxies, ["parameters"] = new JObject() };
-        await _view!.CoreWebView2.ExecuteScriptAsync($"window.__skuaStart({cfg.ToString(Formatting.None)})");
         _ready = true;
+        await _view!.CoreWebView2.ExecuteScriptAsync($"window.__skuaStart({cfg.ToString(Formatting.None)})");
+        Log("__skuaStart sent");
     }
 
     // ---------- host -> SWF ----------
@@ -142,7 +167,8 @@ public class RuffleFlashUtil : IFlashUtil
     {
         if (_lazyManager.Value.ShouldExit && Thread.CurrentThread.Name == "Script Thread")
             _lazyManager.Value.ScriptCts?.Token.ThrowIfCancellationRequested();
-        if (!_ready || _view?.CoreWebView2 is null) return default;
+        if (!_ready || _view?.CoreWebView2 is null) { Log("Call DROPPED (not ready): " + function); return default; }
+        if (function == "loadClient") Log("Call loadClient");
         try
         {
             string argsJson = JsonConvert.SerializeObject(args.Select(a => a is ExpandoObject ? (object)new Dictionary<string, object>((IDictionary<string, object>)a) : a));
@@ -155,6 +181,7 @@ public class RuffleFlashUtil : IFlashUtil
         catch (OperationCanceledException) { throw; }
         catch (Exception e)
         {
+            Log($"Call {function} FAILED: {e.Message}");
             _messenger.Send<FlashErrorMessage>(new(e, function, args));
             return default;
         }
