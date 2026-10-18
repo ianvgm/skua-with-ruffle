@@ -213,6 +213,17 @@ jobs:
           Get-ChildItem Build/x64/Assemblies/ruffle-host -Recurse -File | Select-Object FullName
           if (!(Test-Path Build/x64/skua.swf)) { Write-Host "AVISO: skua.swf nao esta na raiz de Build/x64" }
 
+      - name: Copiar WebView2Loader.dll para ao lado do Skua.exe
+        shell: pwsh
+        run: |
+          $found = Get-ChildItem Build/x64 -Recurse -Filter WebView2Loader.dll -ErrorAction SilentlyContinue
+          $found | Select-Object FullName
+          $dll = $found | Where-Object { $_.FullName -match 'win-x64' } | Select-Object -First 1
+          if (-not $dll) { $dll = $found | Select-Object -First 1 }
+          if (-not $dll) { throw "WebView2Loader.dll nao foi encontrado na saida do build" }
+          Copy-Item $dll.FullName Build/x64/WebView2Loader.dll -Force
+          Write-Host "Copiado: $($dll.FullName) -> Build/x64/WebView2Loader.dll"
+
       - uses: actions/upload-artifact@v4
         with:
           name: Skua-Ruffle-x64
