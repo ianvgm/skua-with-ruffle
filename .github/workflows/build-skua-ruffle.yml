@@ -1,240 +1,369 @@
-name: Build Skua (Ruffle)
+using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.Wpf;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using CommunityToolkit.Mvvm.Messaging;
+using Skua.Core.Flash;
+using Skua.Core.Interfaces;
+using Skua.Core.Messaging;
+using Skua.Core.Utils;
+using System;
+using System.Collections.Generic;
+using System.Dynamic;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Web;
+using System.Net.WebSockets;
+using System.Net.Sockets;
+using System.Net;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Threading;
+using System.Xml.Linq;
 
-on:
-  workflow_dispatch:
+namespace Skua.WPF.Flash;
 
-jobs:
-  build:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
+/// <summary>
+/// IFlashUtil backed by Ruffle (web build) inside WebView2, instead of the Flash ActiveX control.
+/// Wire format with skua.swf is unchanged: same XML as ExternalInterface, so Skua.Core is untouched.
+/// </summary>
+public class RuffleFlashUtil : IFlashUtil
+{
+    private readonly IMessenger _messenger;
+    private readonly Lazy<IScriptManager> _lazyManager;
+    private WebView2? _view;
+    private TcpWebSocketProxy? _proxy;
+    private bool _ready;
+    private static readonly object _logLock = new();
+    private static readonly string _logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Skua", "ruffle-log.txt");
 
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.x'
+    internal static void Log(string text)
+    {
+        try
+        {
+            lock (_logLock)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(_logPath)!);
+                File.AppendAllText(_logPath, $"{DateTime.Now:HH:mm:ss.fff} {text}\n");
+            }
+        }
+        catch { }
+    }
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+    public event FlashCallHandler? FlashCall;
+    /// <summary>Raised on the UI thread with the control to place in the window.</summary>
+    public WebView2? View => _view;
 
-      - name: Verificar skua.swf
-        shell: pwsh
-        run: |
-          if (!(Test-Path prebuilt/skua.swf)) { throw "Falta prebuilt/skua.swf no repositorio." }
+    public RuffleFlashUtil(IMessenger messenger, Lazy<IScriptManager> manager)
+    {
+        _messenger = messenger;
+        _lazyManager = manager;
 
-      - name: Baixar Ruffle (web) do npm
-        shell: pwsh
-        run: |
-          npm pack @ruffle-rs/ruffle@0.7.1
-          New-Item -ItemType Directory -Force ruffle-host/ruffle | Out-Null
-          tar -xzf ruffle-rs-ruffle-0.7.1.tgz -C ruffle-host/ruffle --strip-components=1 --exclude=*.map
-          Get-ChildItem ruffle-host/ruffle | Select-Object Name, Length
+        // Skua compiles scripts against the assemblies already loaded in the process. The old ActiveX host
+        // pulled in WinForms; load it explicitly so scripts that use Form/ProgressBar/Application still compile.
+        _ = new Type[]
+        {
+            typeof(System.Windows.Forms.Form),
+            typeof(System.Windows.Forms.ProgressBar),
+            typeof(System.Windows.Forms.Application),
+            typeof(System.Windows.Forms.DockStyle),
+            typeof(System.Windows.Forms.MessageBox),
+            typeof(System.Drawing.Size),
+            typeof(System.Drawing.Color),
+        };
+    }
 
-      - name: Criar arquivos do Ruffle (index.html e GameContainer)
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force ruffle-host | Out-Null
-          $content = @'
-          <!doctype html>
-          <html><head><meta charset="utf-8">
-          <style>html,body{margin:0;height:100%;background:#000;overflow:hidden}#game{width:100%;height:100%}</style>
-          <script>
-          // Forward console output and errors to the host log (%LOCALAPPDATA%\Skua\ruffle-log.txt)
-          const __post = m => { try { window.chrome.webview.postMessage(m); } catch (e) {} };
-          const __esc = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;");
-          for (const k of ["log","info","warn","error"]) {
-            const o = console[k].bind(console);
-            console[k] = (...a) => { o(...a); __post("<log>["+k+"] "+__esc(a.map(x=>{try{return typeof x==="string"?x:JSON.stringify(x)}catch(e){return String(x)}}).join(" ")).slice(0,600)+"</log>"); };
-          }
-          window.addEventListener("error", e => console.error("window.onerror", e.message, e.filename, e.lineno));
-          window.addEventListener("unhandledrejection", e => console.error("unhandledrejection", String(e.reason)));
-          </script>
-          <script src="ruffle/ruffle.js"></script>
-          </head><body><div id="game"></div>
-          <script>
-          // ---- Flash-ActiveX-compatible XML encoding, so the C# side keeps parsing exactly as before ----
-          const esc = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-          function toXml(v){
-            if (v === null || v === undefined) return "<null/>";
-            if (v === true) return "<true/>";
-            if (v === false) return "<false/>";
-            if (typeof v === "number") return "<number>"+v+"</number>";
-            if (Array.isArray(v)) return "<array>"+v.map((x,i)=>'<property id="'+i+'">'+toXml(x)+"</property>").join("")+"</array>";
-            if (typeof v === "object") return "<object>"+Object.keys(v).map(k=>'<property id="'+esc(k)+'">'+toXml(v[k])+"</property>").join("")+"</object>";
-            return "<string>"+esc(v)+"</string>";
-          }
-          const post = m => window.chrome.webview.postMessage(m);
+    public void InitializeFlash()
+    {
+        try { File.WriteAllText(_logPath, ""); } catch { }
+        Log("InitializeFlash");
+        _view = new WebView2 { DefaultBackgroundColor = System.Drawing.Color.Black };
+        _messenger.Send(new RuffleViewChangedMessage(_view));
+        _ = InitAsync();
+    }
 
-          // ---- SWF -> host (ExternalInterface.call). Names taken from Skua.AS3 ----
-          for (const n of ["loaded","pre-load","packet","pext","packetFromServer","requestLoadGame","debug","openWebsite"]) {
-            window[n] = (...a) => { post('<invoke name="'+n+'" returntype="xml"><arguments>'+a.map(toXml).join("")+"</arguments></invoke>"); };
-          }
+    private async Task InitAsync()
+    {
+        try
+        {
+            string dir = AppContext.BaseDirectory;
+            // Skua's post-build step moves most files into Assemblies\, so look in both places.
+            string host = new[] { Path.Combine(dir, "ruffle-host"), Path.Combine(dir, "Assemblies", "ruffle-host") }
+                .FirstOrDefault(Directory.Exists)
+                ?? throw new DirectoryNotFoundException("ruffle-host folder not found next to Skua.exe");
+            File.Copy(Path.Combine(dir, "skua.swf"), Path.Combine(host, "skua.swf"), true);
 
-          // ---- host -> SWF (ExternalInterface.addCallback), called by C# via ExecuteScriptAsync ----
-          let player;
-          window.__skuaCall = (name, args) => {
-            try { return toXml(player[name](...args)); }
-            catch (e) { console.error("skuaCall", name, e); return "<null/>"; }
-          };
+            // --disable-web-security: lets Ruffle fetch game.aq.com assets without CORS headers (dev shortcut).
+            var env = await CoreWebView2Environment.CreateAsync(null,
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Skua", "WebView2"),
+                new CoreWebView2EnvironmentOptions("--disable-web-security --autoplay-policy=no-user-gesture-required --disable-features=IsolateOrigins,site-per-process"));
+            await _view!.EnsureCoreWebView2Async(env);
+            var cw = _view.CoreWebView2;
+            cw.Settings.AreDefaultContextMenusEnabled = false;
+            cw.Settings.AreDevToolsEnabled = true; // F12 for debugging
+            cw.SetVirtualHostNameToFolderMapping("skua.local", host, CoreWebView2HostResourceAccessKind.Allow);
+            cw.WebMessageReceived += OnWebMessage;
+            cw.NavigationCompleted += (s, a) => Log($"NavigationCompleted success={a.IsSuccess} status={a.WebErrorStatus}");
+            cw.ProcessFailed += (s, a) => Log($"ProcessFailed {a.ProcessFailedKind}");
+            Log("WebView2 ready, host=" + host);
 
-          // Called by C# once the WebSocket->TCP proxy is up. cfg = {socketProxy:[{host,port,proxyUrl}], parameters:{}}
-          window.__skuaStart = cfg => {
-            window.RufflePlayer = window.RufflePlayer || {};
-            const ruffle = window.RufflePlayer.newest();
-            player = ruffle.createPlayer();
-            player.style.width = "100%"; player.style.height = "100%";
-            player.config = {
-              publicPath: "ruffle/", autoplay: "on", unmuteOverlay: "hidden", splashScreen: false,
-              contextMenu: "off", letterbox: "on", allowScriptAccess: true, openUrlMode: "allow",
-              socketProxy: cfg.socketProxy, parameters: cfg.parameters || {}, logLevel: "info"
-            };
-            document.getElementById("game").appendChild(player);
-            player.load({ url: "skua.swf" });
-          };
-          post("<ready/>");
-          </script></body></html>
-          '@
-          Set-Content -Path "ruffle-host/index.html" -Value $content -Encoding UTF8
-          $content = @'
-          <UserControl
-              x:Class="Skua.WPF.UserControls.GameContainerUserControl"
-              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-              xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
-              xmlns:local="clr-namespace:Skua.WPF"
-              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-              d:DesignHeight="450"
-              d:DesignWidth="800"
-              mc:Ignorable="d">
-              <Grid>
-                  <ProgressBar
-                      x:Name="LoadingBar"
-                      Width="150"
-                      Height="150"
-                      IsIndeterminate="True"
-                      Style="{StaticResource MaterialDesignCircularProgressBar}" />
-                  <!-- Was a WindowsFormsHost; now a plain Border that receives the WebView2 (Ruffle) -->
-                  <Border
-                      x:Name="gameContainer"
-                      Margin="1,0,1,1"
-                      Panel.ZIndex="1"
-                      Visibility="Visible" />
-              </Grid>
-          </UserControl>
-          '@
-          Set-Content -Path "Skua.WPF/UserControls/GameContainerUserControl.xaml" -Value $content -Encoding UTF8
-          $content = @'
-          using CommunityToolkit.Mvvm.DependencyInjection;
-          using CommunityToolkit.Mvvm.Messaging;
-          using Skua.Core.Interfaces;
-          using Skua.WPF.Flash;
-          using System.Windows;
-          using System.Windows.Controls;
+            _proxy = new TcpWebSocketProxy(); _proxy.Start();
+            cw.Navigate("https://skua.local/index.html");
+        }
+        catch (Exception e)
+        {
+            Log("InitAsync EXCEPTION " + e);
+            MessageBox.Show("Failed to start Ruffle/WebView2 (is the WebView2 Runtime installed?)\r\n" + e.Message, "Skua + Ruffle");
+            Environment.Exit(0);
+        }
+    }
 
-          namespace Skua.WPF.UserControls;
+    private async void OnWebMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
+    {
+        string msg = e.TryGetWebMessageAsString();
+        if (msg.StartsWith("<log>")) { Log(msg); return; }
+        if (!msg.StartsWith("<invoke name=\"packet") && !msg.StartsWith("<invoke name=\"pext")) Log("FROM SWF: " + (msg.Length > 300 ? msg[..300] : msg));
+        if (msg == "<ready/>") { await StartGameAsync(); return; }
+        try
+        {
+            XElement el = XElement.Parse(msg);
+            string function = el.Attribute("name")!.Value;
+            object[] args = el.Elements().Select(x => FromFlashXml(x)).ToArray();
+            FlashCall?.Invoke(function, args);
+        }
+        catch (Exception ex) { Log("OnWebMessage error: " + ex.Message); }
+    }
 
-          public partial class GameContainerUserControl : UserControl
-          {
-              private IScriptInterface _bot;
+    private async Task StartGameAsync()
+    {
+        var proxies = new JArray();
+        try
+        {
+            string json;
+            try
+            {
+                // Same client Skua itself uses for this request (User-Agent + headers the server expects).
+                json = await HttpClients.GetGHClient().GetStringAsync("http://content.aq.com/game/api/data/servers");
+            }
+            catch (Exception ex1)
+            {
+                Log("server list via Skua client FAILED: " + ex1.Message + " -> retrying with plain client");
+                using var http = new HttpClient();
+                http.DefaultRequestHeaders.UserAgent.ParseAdd("Skua");
+                http.DefaultRequestHeaders.Accept.ParseAdd("application/json");
+                json = await http.GetStringAsync("http://content.aq.com/game/api/data/servers");
+            }
+            Log($"server list: {json.Length} chars, starts: {(json.Length > 160 ? json[..160] : json)}");
+            var servers = JArray.Parse(json);
+            foreach (var s in servers)   // field names (sIP / iPort) must be verified against the live response
+            {
+                string ip = (string)s["sIP"]!; int port = (int)s["iPort"]!;
+                proxies.Add(new JObject
+                {
+                    ["host"] = ip, ["port"] = port,
+                    ["proxyUrl"] = $"ws://127.0.0.1:{_proxy!.Port}/?h={ip}&p={port}"
+                });
+            }
+        }
+        catch (Exception ex) { Log("server list FAILED: " + ex.Message); }
+        Log("socket proxies: " + proxies.Count);
 
-              public GameContainerUserControl()
-              {
-                  InitializeComponent();
-                  _bot = Ioc.Default.GetRequiredService<IScriptInterface>();
-                  WeakReferenceMessenger.Default.Register<GameContainerUserControl, RuffleViewChangedMessage>(this, (r, m) => r.gameContainer.Child = m.View);
-                  Loaded += GameContainer_Loaded;
-              }
+        var cfg = new JObject { ["socketProxy"] = proxies, ["parameters"] = new JObject() };
+        _ready = true;
+        await _view!.CoreWebView2.ExecuteScriptAsync($"window.__skuaStart({cfg.ToString(Formatting.None)})");
+        Log("__skuaStart sent");
+    }
 
-              private void GameContainer_Loaded(object sender, RoutedEventArgs e)
-              {
-                  _bot.Flash.FlashCall += LoadingFlash;
-                  _bot.Flash.InitializeFlash();
-                  Loaded -= GameContainer_Loaded;
-              }
+    // ---------- host -> SWF ----------
+    public string? Call(string function, params object[] args) => Call<string>(function, args);
 
-              private void LoadingFlash(string function, params object[] args)
-              {
-                  if (function == "loaded")
-                  {
-                      LoadingBar.Visibility = Visibility.Hidden;
-                      gameContainer.Visibility = Visibility.Visible;
-                      _bot.Flash.FlashCall -= LoadingFlash;
-                  }
-              }
-          }
-          '@
-          Set-Content -Path "Skua.WPF/UserControls/GameContainerUserControl.xaml.cs" -Value $content -Encoding UTF8
+    public T? Call<T>(string function, params object[] args)
+    {
+        try
+        {
+            object? o = Call(function, typeof(T), args);
+            return o is not null ? (T)o : (T)DefaultProvider.GetDefault<T>(typeof(T));
+        }
+        catch { return (T)DefaultProvider.GetDefault<T>(typeof(T)); }
+    }
 
-      - name: Aplicar patch do Ruffle
-        shell: pwsh
-        run: |
-          # Aplica as 3 edicoes do protótipo Ruffle no codigo do Skua (rodado pelo workflow).
-          $ErrorActionPreference = "Stop"
+    public object? Call(string function, Type type, params object[] args)
+    {
+        if (_lazyManager.Value.ShouldExit && Thread.CurrentThread.Name == "Script Thread")
+            _lazyManager.Value.ScriptCts?.Token.ThrowIfCancellationRequested();
+        if (!_ready || _view?.CoreWebView2 is null) { Log("Call DROPPED (not ready): " + function); return default; }
+        if (function == "loadClient") Log("Call loadClient");
+        try
+        {
+            string argsJson = JsonConvert.SerializeObject(args.Select(a => a is ExpandoObject ? (object)new Dictionary<string, object>((IDictionary<string, object>)a) : a));
+            string js = $"window.__skuaCall({JsonConvert.SerializeObject(function)}, {argsJson})";
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            string? raw = RunOnUi(js);
+            string result = JsonConvert.DeserializeObject<string>(raw ?? "null") ?? "<null/>";
+            sw.Stop();
+            TraceCall(function, args, result, sw.ElapsedMilliseconds);
+            XElement el = XElement.Parse(result);
+            return el.FirstNode is null ? default : Convert.ChangeType(el.FirstNode.ToString(), type);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception e)
+        {
+            Log($"Call {function} FAILED: {e.Message}");
+            _messenger.Send<FlashErrorMessage>(new(e, function, args));
+            return default;
+        }
+    }
 
-          # 1) DI: usar RuffleFlashUtil
-          $cs = "Skua.WPF/Services/ConfigureServices.cs"
-          $t = Get-Content $cs -Raw
-          if ($t -notmatch "RuffleFlashUtil") {
-              $n = $t.Replace("AddSingleton<IFlashUtil, FlashUtil>()", "AddSingleton<IFlashUtil, RuffleFlashUtil>()")
-              if ($n -eq $t) { throw "Nao achei AddSingleton<IFlashUtil, FlashUtil>() em $cs" }
-              Set-Content $cs $n -NoNewline -Encoding UTF8
-          }
 
-          # 2) WebView2 no Skua.WPF
-          $p = "Skua.WPF/Skua.WPF.csproj"
-          $t = Get-Content $p -Raw
-          if ($t -notmatch "Microsoft.Web.WebView2") {
-              $add = "  <ItemGroup>`n    <PackageReference Include=`"Microsoft.Web.WebView2`" Version=`"1.0.*`" />`n  </ItemGroup>`n</Project>"
-              Set-Content $p $t.Replace("</Project>", $add) -NoNewline -Encoding UTF8
-          }
+    // Diagnostics: log the first results of each function, plus slow calls.
+    private readonly Dictionary<string, int> _traceCount = new();
+    private int _slowCount;
+    private void TraceCall(string function, object[] args, string result, long ms)
+    {
+        try
+        {
+            bool first;
+            lock (_traceCount)
+            {
+                _traceCount.TryGetValue(function, out int n);
+                first = n < 4;
+                _traceCount[function] = n + 1;
+            }
+            bool slow = ms > 100 && Interlocked.Increment(ref _slowCount) <= 30;
+            if (first || slow)
+            {
+                string a = string.Join(",", args.Select(x => x?.ToString() ?? "null"));
+                if (a.Length > 80) a = a[..80];
+                string r = result.Length > 120 ? result[..120] : result;
+                Log($"CALL {function}({a}) -> {r} [{ms}ms]{(slow ? " SLOW" : "")}");
+            }
+        }
+        catch { }
+    }
 
-          # 3) copiar ruffle-host junto com o app
-          $p = "Skua.App.WPF/Skua.App.WPF.csproj"
-          $t = Get-Content $p -Raw
-          if ($t -notmatch "ruffle-host") {
-              $add = "  <ItemGroup>`n    <None Include=`"..\ruffle-host\**`" Link=`"ruffle-host\%(RecursiveDir)%(Filename)%(Extension)`">`n      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>`n    </None>`n  </ItemGroup>`n</Project>"
-              Set-Content $p $t.Replace("</Project>", $add) -NoNewline -Encoding UTF8
-          }
+    private string? RunOnUi(string js)
+    {
+        Dispatcher d = Application.Current.Dispatcher;
+        if (!d.CheckAccess())
+            return d.Invoke(() => _view!.CoreWebView2.ExecuteScriptAsync(js)).GetAwaiter().GetResult();
 
-          # 4) skua.swf do usuario no lugar esperado pelo build
-          New-Item -ItemType Directory -Force "Skua.AS3/skua/bin" | Out-Null
-          Copy-Item "prebuilt/skua.swf" "Skua.AS3/skua/bin/skua.swf" -Force
-          Write-Host "Patch aplicado."
+        // Called from the UI thread: pump messages while waiting to avoid a deadlock.
+        Task<string> t = _view!.CoreWebView2.ExecuteScriptAsync(js);
+        var frame = new DispatcherFrame();
+        t.ContinueWith(_ => frame.Continue = false, TaskScheduler.Default);
+        Dispatcher.PushFrame(frame);
+        return t.GetAwaiter().GetResult();
+    }
 
-      - name: Restore
-        run: dotnet restore Skua.sln -v:m
+    public object FromFlashXml(XElement el)
+    {
+        switch (el.Name.ToString())
+        {
+            case "number": return int.TryParse(el.Value, out int i) ? i : float.TryParse(el.Value, out float f) ? f : 0;
+            case "true": return true;
+            case "false": return false;
+            case "null": return null!;
+            case "array": return el.Elements().Select(e => FromFlashXml(e)).ToArray();
+            case "object":
+                dynamic d = new ExpandoObject();
+                foreach (var e in el.Elements()) ((IDictionary<string, object>)d)[e.Attribute("id")!.Value] = FromFlashXml(e.Elements().First());
+                return d;
+            default: return el.Value;
+        }
+    }
 
-      - name: Build source generators
-        run: dotnet build Skua.Core.Generators/Skua.Core.Generators.csproj -c Release -p:Platform=AnyCPU -clp:ErrorsOnly
+    public IFlashObject<T> CreateFlashObject<T>(string path) => new FlashObject<T>(Call<int>("lnkCreate", path), this);
 
-      - name: Build Skua x64
-        run: dotnet build Skua.sln -c Release -p:Platform=x64 --no-restore -p:WarningLevel=0 -clp:ErrorsOnly -v:m
+    public void Dispose()
+    {
+        _ready = false;
+        try { _proxy?.Dispose(); } catch { }
+        try { _view?.Dispose(); } catch { }
+    }
+}
 
-      - name: Garantir ruffle-host na saida
-        shell: pwsh
-        run: |
-          Write-Host "== Conteudo de Build/x64 =="
-          Get-ChildItem Build/x64 | Select-Object Name
-          if (!(Test-Path ruffle-host/index.html)) { throw "ruffle-host/index.html NAO esta no repositorio (suba a pasta ruffle-host do zip)." }
-          if (!(Test-Path ruffle-host/ruffle/ruffle.js)) { throw "ruffle.js nao foi baixado do npm." }
-          New-Item -ItemType Directory -Force Build/x64/Assemblies | Out-Null
-          Copy-Item ruffle-host Build/x64/Assemblies/ruffle-host -Recurse -Force
-          Write-Host "== ruffle-host copiado =="
-          Get-ChildItem Build/x64/Assemblies/ruffle-host -Recurse -File | Select-Object FullName
-          if (!(Test-Path Build/x64/skua.swf)) { Write-Host "AVISO: skua.swf nao esta na raiz de Build/x64" }
+public sealed record RuffleViewChangedMessage(WebView2 View);
 
-      - name: Copiar WebView2Loader.dll para ao lado do Skua.exe
-        shell: pwsh
-        run: |
-          $found = Get-ChildItem Build/x64 -Recurse -Filter WebView2Loader.dll -ErrorAction SilentlyContinue
-          $found | Select-Object FullName
-          $dll = $found | Where-Object { $_.FullName -match 'win-x64' } | Select-Object -First 1
-          if (-not $dll) { $dll = $found | Select-Object -First 1 }
-          if (-not $dll) { throw "WebView2Loader.dll nao foi encontrado na saida do build" }
-          Copy-Item $dll.FullName Build/x64/WebView2Loader.dll -Force
-          Write-Host "Copiado: $($dll.FullName) -> Build/x64/WebView2Loader.dll"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Skua-Ruffle-x64
-          path: Build/x64
+/// <summary>
+/// Ruffle (web) cannot open raw TCP sockets, and AQW's SmartFox connection is raw TCP.
+/// This tiny proxy accepts a WebSocket at ws://127.0.0.1:PORT/?h=HOST&amp;p=PORT and pipes bytes to HOST:PORT.
+/// </summary>
+public sealed class TcpWebSocketProxy : IDisposable
+{
+    private readonly HttpListener _http = new();
+    private readonly CancellationTokenSource _cts = new();
+    public int Port { get; }
+
+    public TcpWebSocketProxy()
+    {
+        var l = new TcpListener(IPAddress.Loopback, 0); l.Start();
+        Port = ((IPEndPoint)l.LocalEndpoint).Port; l.Stop();
+        _http.Prefixes.Add($"http://127.0.0.1:{Port}/");
+    }
+
+    public void Start()
+    {
+        _http.Start();
+        _ = Task.Run(async () =>
+        {
+            while (!_cts.IsCancellationRequested)
+            {
+                try
+                {
+                    var ctx = await _http.GetContextAsync();
+                    if (!ctx.Request.IsWebSocketRequest) { ctx.Response.StatusCode = 400; ctx.Response.Close(); continue; }
+                    _ = Task.Run(() => Handle(ctx));
+                }
+                catch { if (_cts.IsCancellationRequested) break; }
+            }
+        });
+    }
+
+    private async Task Handle(HttpListenerContext ctx)
+    {
+        try
+        {
+            var q = HttpUtility.ParseQueryString(ctx.Request.Url!.Query);
+            string host = q["h"]!; int port = int.Parse(q["p"]!);
+            RuffleFlashUtil.Log($"PROXY: websocket request for {host}:{port}");
+            var ws = (await ctx.AcceptWebSocketAsync(null)).WebSocket;
+            using var tcp = new TcpClient();
+            await tcp.ConnectAsync(host, port);
+            RuffleFlashUtil.Log($"PROXY: TCP connected to {host}:{port}");
+            var ns = tcp.GetStream();
+            long sent = 0, recv = 0;
+
+            var up = Task.Run(async () =>      // Ruffle -> server
+            {
+                var buf = new byte[16384];
+                while (ws.State == WebSocketState.Open)
+                {
+                    var r = await ws.ReceiveAsync(buf.AsMemory(), _cts.Token);
+                    if (r.MessageType == WebSocketMessageType.Close) break;
+                    await ns.WriteAsync(buf.AsMemory(0, r.Count), _cts.Token);
+                    sent += r.Count;
+                    if (sent == r.Count) RuffleFlashUtil.Log($"PROXY: first client->server {r.Count} bytes");
+                }
+            });
+            var down = Task.Run(async () =>    // server -> Ruffle
+            {
+                var buf = new byte[16384];
+                int n;
+                while ((n = await ns.ReadAsync(buf, _cts.Token)) > 0)
+                    await ws.SendAsync(buf.AsMemory(0, n), WebSocketMessageType.Binary, true, _cts.Token);
+                    recv += n;
+                    if (recv == n) RuffleFlashUtil.Log($"PROXY: first server->client {n} bytes");
+            });
+            await Task.WhenAny(up, down);
+            RuffleFlashUtil.Log($"PROXY: closed {host}:{port} sent={sent} recv={recv}");
+            try { await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "", CancellationToken.None); } catch { }
+        }
+        catch (Exception ex) { RuffleFlashUtil.Log("PROXY ERROR: " + ex.Message); try { ctx.Response.Abort(); } catch { } }
+    }
+
+    public void Dispose() { _cts.Cancel(); try { _http.Close(); } catch { } }
+}
