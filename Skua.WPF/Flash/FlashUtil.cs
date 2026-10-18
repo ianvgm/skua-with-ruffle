@@ -1,155 +1,153 @@
-using AxShockwaveFlashObjects;
-using CommunityToolkit.Mvvm.DependencyInjection;
+using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.Wpf;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using CommunityToolkit.Mvvm.Messaging;
 using Skua.Core.Flash;
 using Skua.Core.Interfaces;
 using Skua.Core.Messaging;
-using Skua.Core.Utils;
 using System;
 using System.Collections.Generic;
 using System.Dynamic;
 using System.IO;
 using System.Linq;
-using System.Security;
+using System.Net.Http;
 using System.Text;
 using System.Threading;
-using System.Windows.Forms;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Threading;
 using System.Xml.Linq;
 
 namespace Skua.WPF.Flash;
 
-public class FlashUtil : IFlashUtil
+/// <summary>
+/// IFlashUtil backed by Ruffle (web build) inside WebView2, instead of the Flash ActiveX control.
+/// Wire format with skua.swf is unchanged: same XML as ExternalInterface, so Skua.Core is untouched.
+/// </summary>
+public class RuffleFlashUtil : IFlashUtil
 {
-    public FlashUtil(IMessenger messenger, Lazy<IScriptManager> manager)
+    private readonly IMessenger _messenger;
+    private readonly Lazy<IScriptManager> _lazyManager;
+    private WebView2? _view;
+    private TcpWebSocketProxy? _proxy;
+    private bool _ready;
+
+    public event FlashCallHandler? FlashCall;
+    /// <summary>Raised on the UI thread with the control to place in the window.</summary>
+    public WebView2? View => _view;
+
+    public RuffleFlashUtil(IMessenger messenger, Lazy<IScriptManager> manager)
     {
         _messenger = messenger;
         _lazyManager = manager;
     }
 
-    private readonly IMessenger _messenger;
-    private readonly Lazy<IScriptManager> _lazyManager;
-    private AxShockwaveFlash? Flash;
-
-    public event FlashCallHandler? FlashCall;
-
     public void InitializeFlash()
     {
+        _view = new WebView2 { DefaultBackgroundColor = System.Drawing.Color.Black };
+        _messenger.Send(new RuffleViewChangedMessage(_view));
+        _ = InitAsync();
+    }
+
+    private async Task InitAsync()
+    {
         try
         {
-            if (!EoLHook.IsHooked)
-                EoLHook.Hook();
+            string dir = AppContext.BaseDirectory;
+            // Skua's post-build step moves most files into Assemblies\, so look in both places.
+            string host = new[] { Path.Combine(dir, "ruffle-host"), Path.Combine(dir, "Assemblies", "ruffle-host") }
+                .FirstOrDefault(Directory.Exists)
+                ?? throw new DirectoryNotFoundException("ruffle-host folder not found next to Skua.exe");
+            File.Copy(Path.Combine(dir, "skua.swf"), Path.Combine(host, "skua.swf"), true);
 
-            CleanupOldFlash();
+            // --disable-web-security: lets Ruffle fetch game.aq.com assets without CORS headers (dev shortcut).
+            var env = await CoreWebView2Environment.CreateAsync(null,
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Skua", "WebView2"),
+                new CoreWebView2EnvironmentOptions("--disable-web-security --autoplay-policy=no-user-gesture-required --disable-features=IsolateOrigins,site-per-process"));
+            await _view!.EnsureCoreWebView2Async(env);
+            var cw = _view.CoreWebView2;
+            cw.Settings.AreDefaultContextMenusEnabled = false;
+            cw.Settings.AreDevToolsEnabled = true; // F12 for debugging
+            cw.SetVirtualHostNameToFolderMapping("skua.local", host, CoreWebView2HostResourceAccessKind.Allow);
+            cw.WebMessageReceived += OnWebMessage;
 
-            AxShockwaveFlash flash = new();
-            flash.BeginInit();
-            flash.Name = "flash";
-            flash.Dock = DockStyle.Fill;
-            flash.TabIndex = 0;
-            flash.FlashCall += CallHandler;
-
-            _messenger.Send<FlashChangedMessage<AxShockwaveFlash>>(new(flash));
-            flash.EndInit();
-            Flash = flash;
-            byte[] swf = File.ReadAllBytes("skua.swf");
-            using MemoryStream stream = new();
-            using BinaryWriter writer = new(stream);
-            writer.Write(8 + swf.Length);
-            writer.Write(1432769894);
-            writer.Write(swf.Length);
-            writer.Write(swf);
-            writer.Seek(0, SeekOrigin.Begin);
-            flash.OcxState = new AxHost.State(stream, 1, false, null);
+            _proxy = new TcpWebSocketProxy(); _proxy.Start();
+            cw.Navigate("https://skua.local/index.html");
         }
-        catch
+        catch (Exception e)
         {
-            if (MessageBox.Show($"Please, uninstall and then reinstall CleanFlash via the Gif provided \r\nDo you want view the instructional Gif?", "Clean Flash missing/installed incorrectly", MessageBoxButtons.YesNo, MessageBoxIcon.Exclamation) == DialogResult.Yes)
-                Ioc.Default.GetRequiredService<IProcessService>().OpenLink("https://imgur.com/ztsLYZ1");
+            MessageBox.Show("Failed to start Ruffle/WebView2 (is the WebView2 Runtime installed?)\r\n" + e.Message, "Skua + Ruffle");
             Environment.Exit(0);
         }
-        finally
-        {
-            EoLHook.Unhook();
-        }
     }
 
-    private void CleanupOldFlash()
+    private async void OnWebMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
     {
-        if (Flash == null) return;
-
-        Flash.FlashCall -= CallHandler;
-
+        string msg = e.TryGetWebMessageAsString();
+        if (msg == "<ready/>") { await StartGameAsync(); return; }
         try
         {
-            Flash.Stop();
+            XElement el = XElement.Parse(msg);
+            string function = el.Attribute("name")!.Value;
+            object[] args = el.Elements().Select(x => FromFlashXml(x)).ToArray();
+            FlashCall?.Invoke(function, args);
         }
-        catch { /* ignored */ }
+        catch { /* ignore malformed */ }
+    }
 
-        object ocx = null;
+    private async Task StartGameAsync()
+    {
+        var proxies = new JArray();
         try
         {
-            ocx = Flash.GetOcx();
-        }
-        catch { /* ignored */ }
-
-        Flash.Dispose();
-        Flash = null;
-
-        if (ocx != null)
-        {
-            try
+            using var http = new HttpClient();
+            var servers = JArray.Parse(await http.GetStringAsync("http://content.aq.com/game/api/data/servers"));
+            foreach (var s in servers)   // field names (sIP / iPort) must be verified against the live response
             {
-                System.Runtime.InteropServices.Marshal.FinalReleaseComObject(ocx);
+                string ip = (string)s["sIP"]!; int port = (int)s["iPort"]!;
+                proxies.Add(new JObject
+                {
+                    ["host"] = ip, ["port"] = port,
+                    ["proxyUrl"] = $"ws://127.0.0.1:{_proxy!.Port}/?h={ip}&p={port}"
+                });
             }
-            catch { /* ignored */ }
         }
+        catch { /* servers list unavailable: sockets will fail until fixed */ }
+
+        var cfg = new JObject { ["socketProxy"] = proxies, ["parameters"] = new JObject() };
+        await _view!.CoreWebView2.ExecuteScriptAsync($"window.__skuaStart({cfg.ToString(Formatting.None)})");
+        _ready = true;
     }
 
+    // ---------- host -> SWF ----------
+    public string? Call(string function, params object[] args) => Call<string>(function, args);
 
-    private void CallHandler(object sender, _IShockwaveFlashEvents_FlashCallEvent e)
-    {
-        XElement el = XElement.Parse(e.request);
-        string function = el.Attribute("name")!.Value;
-        object[] args = el.Elements().Select(x => FromFlashXml(x)).ToArray();
-        FlashCall?.Invoke(function, args);
-    }
-
-    public string Call(string function, params object[] args)
-    {
-        return Call<string>(function, args);
-    }
-
-    public T Call<T>(string function, params object[] args)
+    public T? Call<T>(string function, params object[] args)
     {
         try
         {
-            object o = Call(function, typeof(T), args);
+            object? o = Call(function, typeof(T), args);
             return o is not null ? (T)o : (T)DefaultProvider.GetDefault<T>(typeof(T));
         }
-        catch
-        {
-            return (T)DefaultProvider.GetDefault<T>(typeof(T));
-        }
+        catch { return (T)DefaultProvider.GetDefault<T>(typeof(T)); }
     }
 
-    public object Call(string function, Type type, params object[] args)
+    public object? Call(string function, Type type, params object[] args)
     {
         if (_lazyManager.Value.ShouldExit && Thread.CurrentThread.Name == "Script Thread")
             _lazyManager.Value.ScriptCts?.Token.ThrowIfCancellationRequested();
+        if (!_ready || _view?.CoreWebView2 is null) return default;
         try
         {
-            StringBuilder req = new StringBuilder().Append($"<invoke name=\"{function}\" returntype=\"xml\">");
-            if (args.Length > 0)
-            {
-                req.Append("<arguments>");
-                args.ForEach(o => req.Append(ToFlashXml(o)));
-                req.Append("</arguments>");
-            }
-            req.Append("</invoke>");
-            string result = Flash?.CallFunction(req.ToString())!;
+            string argsJson = JsonConvert.SerializeObject(args.Select(a => a is ExpandoObject ? (object)new Dictionary<string, object>((IDictionary<string, object>)a) : a));
+            string js = $"window.__skuaCall({JsonConvert.SerializeObject(function)}, {argsJson})";
+            string? raw = RunOnUi(js);
+            string result = JsonConvert.DeserializeObject<string>(raw ?? "null") ?? "<null/>";
             XElement el = XElement.Parse(result);
-            return el is null || el.FirstNode is null ? default : Convert.ChangeType(el.FirstNode.ToString(), type);
+            return el.FirstNode is null ? default : Convert.ChangeType(el.FirstNode.ToString(), type);
         }
+        catch (OperationCanceledException) { throw; }
         catch (Exception e)
         {
             _messenger.Send<FlashErrorMessage>(new(e, function, args));
@@ -157,85 +155,45 @@ public class FlashUtil : IFlashUtil
         }
     }
 
-    public static string ToFlashXml(object o)
+    private string? RunOnUi(string js)
     {
-        switch (o)
-        {
-            case null:
-                return "<null/>";
+        Dispatcher d = Application.Current.Dispatcher;
+        if (!d.CheckAccess())
+            return d.Invoke(() => _view!.CoreWebView2.ExecuteScriptAsync(js)).GetAwaiter().GetResult();
 
-            case bool _:
-                return $"<{o.ToString()!.ToLower()}/>";
-
-            case double _:
-            case float _:
-            case long _:
-            case int _:
-                return $"<number>{o}</number>";
-
-            case ExpandoObject _:
-                StringBuilder sb = new StringBuilder().Append("<object>");
-                foreach (KeyValuePair<string, object> kvp in (o as IDictionary<string, object>)!)
-                    sb.Append($"<property id=\"{kvp.Key}\">{ToFlashXml(kvp.Value)}</property>");
-                return sb.Append("</object>").ToString();
-
-            default:
-                if (o is Array)
-                {
-                    StringBuilder _sb = new StringBuilder().Append("<array>");
-                    int k = 0;
-                    foreach (object el in (o as Array)!)
-                        _sb.Append($"<property id=\"{k++}\">{ToFlashXml(el)}</property>");
-                    return _sb.Append("</array>").ToString();
-                }
-                return $"<string>{SecurityElement.Escape(o.ToString())}</string>";
-        }
+        // Called from the UI thread: pump messages while waiting to avoid a deadlock.
+        Task<string> t = _view!.CoreWebView2.ExecuteScriptAsync(js);
+        var frame = new DispatcherFrame();
+        t.ContinueWith(_ => frame.Continue = false, TaskScheduler.Default);
+        Dispatcher.PushFrame(frame);
+        return t.GetAwaiter().GetResult();
     }
 
     public object FromFlashXml(XElement el)
     {
         switch (el.Name.ToString())
         {
-            case "number":
-                return int.TryParse(el.Value, out int i) ? i : float.TryParse(el.Value, out float f) ? f : 0;
-
-            case "true":
-                return true;
-
-            case "false":
-                return false;
-
-            case "null":
-                return null!;
-
-            case "array":
-                return el.Elements().Select(e => FromFlashXml(e)).ToArray();
-
+            case "number": return int.TryParse(el.Value, out int i) ? i : float.TryParse(el.Value, out float f) ? f : 0;
+            case "true": return true;
+            case "false": return false;
+            case "null": return null!;
+            case "array": return el.Elements().Select(e => FromFlashXml(e)).ToArray();
             case "object":
                 dynamic d = new ExpandoObject();
-                el.Elements().ForEach(e => d[e.Attribute("id")!.Value] = FromFlashXml(e.Elements().First()));
+                foreach (var e in el.Elements()) ((IDictionary<string, object>)d)[e.Attribute("id")!.Value] = FromFlashXml(e.Elements().First());
                 return d;
-
-            default:
-                return el.Value;
+            default: return el.Value;
         }
     }
 
-    public IFlashObject<T> CreateFlashObject<T>(string path)
-    {
-        return new FlashObject<T>(Call<int>("lnkCreate", path), this);
-    }
+    public IFlashObject<T> CreateFlashObject<T>(string path) => new FlashObject<T>(Call<int>("lnkCreate", path), this);
 
     public void Dispose()
     {
-        try
-        {
-            CleanupOldFlash();
-        }
-        catch { /* ignored */ }
-        finally
-        {
-            EoLHook.Unhook();
-        }
+        _ready = false;
+        try { _proxy?.Dispose(); } catch { }
+        try { _view?.Dispose(); } catch { }
     }
 }
+
+public sealed record RuffleViewChangedMessage(WebView2 View);
